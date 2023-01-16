@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate rocket;
-
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 use tokio::fs::File;
@@ -13,11 +10,24 @@ use sqlx::types::Uuid;
 use sqlx::Error as SqlError;
 
 use rocket::data::Capped;
+use rocket::fairing::AdHoc;
 use rocket::http::{ContentType, Header};
 use rocket::request::{FromParam, Request};
 use rocket::response::{self, Responder};
 
 use rocket::http::uri::fmt::{FromUriParam, Path as UriPath};
+use rocket::http::uri::Absolute;
+
+use rocket::{catch, catchers, get, launch, post, routes, uri, FromForm, State};
+use serde::Deserialize;
+
+static FILE_PATH: &'static str = "/tmp/test";
+
+#[derive(Deserialize)]
+struct AppConfig<'a> {
+    file_path: String,
+    base_url: Absolute<'a>,
+}
 
 fn to_ipv6(addr: IpAddr) -> Ipv6Addr {
     match addr {
@@ -97,8 +107,8 @@ impl FromUriParam<UriPath, FileDescriptor> for FileDescriptor {
 struct FileDownload(File, FileInfo);
 
 impl FileDownload {
-    pub async fn open(fd: FileInfo) -> std::io::Result<Self> {
-        let path = Path::new("/tmp/test").join(fd.fd.to_string());
+    pub async fn open(fd: FileInfo, file_path: &str) -> std::io::Result<Self> {
+        let path = Path::new(&file_path).join(fd.fd.to_string());
         let file = File::open(path).await?;
         Ok(Self(file, fd))
     }
@@ -161,8 +171,6 @@ async fn get_file(
         None => return Ok(None),
     };
 
-    println!("{}", addr);
-
     Ok(Some(FileInfo::new(fd, name, addr)))
 }
 
@@ -207,16 +215,29 @@ impl From<SqlError> for FileError {
     }
 }
 
+async fn start_file_download(
+    db: Connection<FileIndex>,
+    fd: FileDescriptor,
+    name: Option<String>,
+    file_path: &str,
+) -> Result<Option<FileDownload>, FileError> {
+    Ok(if let Some(mut file) = get_file(db, fd).await? {
+        if let Some(n) = name {
+            file.name = Some(n);
+        }
+        Some(FileDownload::open(file, file_path).await?)
+    } else {
+        None
+    })
+}
+
 #[get("/fd/<fd>")]
 async fn download_file(
     db: Connection<FileIndex>,
     fd: FileDescriptor,
+    config: &State<AppConfig<'_>>,
 ) -> Result<Option<FileDownload>, FileError> {
-    Ok(if let Some(file) = get_file(db, fd).await? {
-        Some(FileDownload::open(file).await?)
-    } else {
-        None
-    })
+    start_file_download(db, fd, None, &config.file_path).await
 }
 
 #[get("/fd/<fd>/<name>")]
@@ -224,13 +245,9 @@ async fn download_file_named(
     db: Connection<FileIndex>,
     fd: FileDescriptor,
     name: String,
+    config: &State<AppConfig<'_>>,
 ) -> Result<Option<FileDownload>, FileError> {
-    Ok(if let Some(mut file) = get_file(db, fd).await? {
-        file.name = Some(name);
-        Some(FileDownload::open(file).await?)
-    } else {
-        None
-    })
+    start_file_download(db, fd, Some(name), &config.file_path).await
 }
 
 #[get("/fd/<_>", rank = 2)]
@@ -243,6 +260,7 @@ async fn upload_file(
     name: Option<String>,
     file: &mut Capped<TempFile<'_>>,
     addr: IpAddr,
+    base_url: &Absolute<'_>,
 ) -> Result<Option<String>, FileError> {
     if !file.is_complete() {
         return Err(FileError::FileTooBig("ENOSPC: No space left on device"));
@@ -250,7 +268,7 @@ async fn upload_file(
 
     let fd: FileDescriptor = Uuid::new_v4().into();
 
-    let path = Path::new("/tmp/test").join(fd.to_string());
+    let path = Path::new(FILE_PATH).join(fd.to_string());
     file.move_copy_to(path.clone()).await?;
 
     let file = FileInfo::new(fd, name, to_ipv6(addr));
@@ -258,7 +276,7 @@ async fn upload_file(
 
     Ok(Some(format!(
         "{}\n",
-        uri!("http://localhost:8000", download_file(fd))
+        uri!(base_url.clone(), download_file(fd))
     )))
 }
 
@@ -267,8 +285,9 @@ async fn upload_file_raw(
     db: Connection<FileIndex>,
     mut file: Capped<TempFile<'_>>,
     addr: IpAddr,
+    config: &State<AppConfig<'_>>,
 ) -> Result<Option<String>, FileError> {
-    upload_file(db, None, &mut file, addr).await
+    upload_file(db, None, &mut file, addr, &config.base_url).await
 }
 
 #[post("/raw", format = "multipart/form-data", rank = 2)]
@@ -287,8 +306,16 @@ async fn upload_file_form(
     db: Connection<FileIndex>,
     mut form: Form<FileDescriptorForm<'_>>,
     addr: IpAddr,
+    config: &State<AppConfig<'_>>,
 ) -> Result<Option<String>, FileError> {
-    upload_file(db, form.name.clone(), &mut form.file, addr).await
+    upload_file(
+        db,
+        form.name.clone(),
+        &mut form.file,
+        addr,
+        &config.base_url,
+    )
+    .await
 }
 
 #[catch(404)]
@@ -334,4 +361,5 @@ fn rocket() -> _ {
         .register("/", catchers![not_found, invalid_form, server_error])
         .register("/fd", catchers![file_not_found])
         .attach(FileIndex::init())
+        .attach(AdHoc::config::<AppConfig>())
 }

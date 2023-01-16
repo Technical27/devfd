@@ -4,3 +4,7 @@ min_connections = 2
 max_connections = 10
 connect_timeout = 5
 idle_timeout = 120
+
+[debug]
+file_path = "/tmp/test"
+base_url = "http://localhost:8000"
