@@ -1,13 +1,13 @@
-use std::net::{IpAddr, Ipv6Addr};
-use std::path::Path;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use tokio::fs::File;
 
 use rocket::form::Form;
 use rocket::fs::TempFile;
 use rocket_db_pools::{Connection, Database};
 
-use sqlx::types::Uuid;
 use sqlx::Error as SqlError;
+use uuid::Uuid;
 
 use rocket::data::Capped;
 use rocket::fairing::AdHoc;
@@ -21,30 +21,29 @@ use rocket::http::uri::Absolute;
 use rocket::{catch, catchers, get, launch, post, routes, uri, FromForm, State};
 use serde::Deserialize;
 
-static FILE_PATH: &'static str = "/tmp/test";
-
 #[derive(Deserialize)]
 struct AppConfig<'a> {
-    file_path: String,
+    file_path: PathBuf,
     base_url: Absolute<'a>,
 }
 
-fn to_ipv6(addr: IpAddr) -> Ipv6Addr {
-    match addr {
-        IpAddr::V4(a) => a.to_ipv6_mapped(),
-        IpAddr::V6(a) => a,
+fn bytes_to_ip(bytes: Vec<u8>) -> Option<IpAddr> {
+    match bytes.len() {
+        16 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&bytes);
+
+            Some(IpAddr::V6(Ipv6Addr::from(b)))
+        }
+        4 => {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes);
+
+            Some(IpAddr::V4(Ipv4Addr::from(b)))
+        }
+
+        _ => None,
     }
-}
-
-fn bytes_to_ipv6(bytes: Vec<u8>) -> Option<Ipv6Addr> {
-    if bytes.len() != 16 {
-        return None;
-    }
-
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&bytes);
-
-    Some(Ipv6Addr::from(b))
 }
 
 #[repr(transparent)]
@@ -70,7 +69,7 @@ impl ToString for FileDescriptor {
 }
 
 enum FileDescriptorParamError {
-    Uuid(sqlx::types::uuid::Error),
+    Uuid(uuid::Error),
     InvalidChars,
 }
 
@@ -107,8 +106,8 @@ impl FromUriParam<UriPath, FileDescriptor> for FileDescriptor {
 struct FileDownload(File, FileInfo);
 
 impl FileDownload {
-    pub async fn open(fd: FileInfo, file_path: &str) -> std::io::Result<Self> {
-        let path = Path::new(&file_path).join(fd.fd.to_string());
+    pub async fn open(fd: FileInfo, file_path: &Path) -> std::io::Result<Self> {
+        let path = file_path.join(fd.fd.to_string());
         let file = File::open(path).await?;
         Ok(Self(file, fd))
     }
@@ -138,11 +137,11 @@ struct FileIndex(rocket_db_pools::sqlx::SqlitePool);
 struct FileInfo {
     fd: FileDescriptor,
     name: Option<String>,
-    upload_ip: Ipv6Addr,
+    upload_ip: IpAddr,
 }
 
 impl FileInfo {
-    pub fn new(fd: FileDescriptor, name: Option<String>, upload_ip: Ipv6Addr) -> Self {
+    pub fn new(fd: FileDescriptor, name: Option<String>, upload_ip: IpAddr) -> Self {
         Self {
             fd,
             name,
@@ -166,7 +165,7 @@ async fn get_file(
     };
 
     let name = info.name;
-    let addr = match bytes_to_ipv6(info.upload_ip) {
+    let addr = match bytes_to_ip(info.upload_ip) {
         Some(a) => a,
         None => return Ok(None),
     };
@@ -176,7 +175,10 @@ async fn get_file(
 
 async fn add_file(mut db: Connection<FileIndex>, info: FileInfo) -> Result<(), FileError> {
     let f = info.fd.as_ref();
-    let upload_ip = info.upload_ip.octets().to_vec();
+    let upload_ip = match info.upload_ip {
+        IpAddr::V6(a) => a.octets().to_vec(),
+        IpAddr::V4(a) => a.octets().to_vec(),
+    };
     sqlx::query!(
         "INSERT INTO file_index (fd, name, upload_ip) VALUES (?1, ?2, ?3)",
         f,
@@ -211,7 +213,10 @@ impl From<std::io::Error> for FileError {
 
 impl From<SqlError> for FileError {
     fn from(e: SqlError) -> Self {
-        Self::SqlError("EROFS: Read-only file system\n", e)
+        Self::SqlError(
+            "EROFS: Read-only file system\n// I thought this error was impossible\n",
+            e,
+        )
     }
 }
 
@@ -219,7 +224,7 @@ async fn start_file_download(
     db: Connection<FileIndex>,
     fd: FileDescriptor,
     name: Option<String>,
-    file_path: &str,
+    file_path: &Path,
 ) -> Result<Option<FileDownload>, FileError> {
     Ok(if let Some(mut file) = get_file(db, fd).await? {
         if let Some(n) = name {
@@ -261,6 +266,7 @@ async fn upload_file(
     file: &mut Capped<TempFile<'_>>,
     addr: IpAddr,
     base_url: &Absolute<'_>,
+    file_path: &Path,
 ) -> Result<Option<String>, FileError> {
     if !file.is_complete() {
         return Err(FileError::FileTooBig("ENOSPC: No space left on device"));
@@ -268,10 +274,10 @@ async fn upload_file(
 
     let fd: FileDescriptor = Uuid::new_v4().into();
 
-    let path = Path::new(FILE_PATH).join(fd.to_string());
+    let path = Path::new(&file_path).join(fd.to_string());
     file.move_copy_to(path.clone()).await?;
 
-    let file = FileInfo::new(fd, name, to_ipv6(addr));
+    let file = FileInfo::new(fd, name, addr);
     add_file(db, file).await?;
 
     Ok(Some(format!(
@@ -287,7 +293,15 @@ async fn upload_file_raw(
     addr: IpAddr,
     config: &State<AppConfig<'_>>,
 ) -> Result<Option<String>, FileError> {
-    upload_file(db, None, &mut file, addr, &config.base_url).await
+    upload_file(
+        db,
+        None,
+        &mut file,
+        addr,
+        &config.base_url,
+        &config.file_path,
+    )
+    .await
 }
 
 #[post("/raw", format = "multipart/form-data", rank = 2)]
@@ -314,6 +328,7 @@ async fn upload_file_form(
         &mut form.file,
         addr,
         &config.base_url,
+        &config.file_path,
     )
     .await
 }
