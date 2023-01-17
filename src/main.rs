@@ -9,9 +9,8 @@ use rocket_db_pools::{Connection, Database};
 use sqlx::Error as SqlError;
 use uuid::Uuid;
 
-use rocket::data::Capped;
 use rocket::fairing::AdHoc;
-use rocket::http::{ContentType, Header};
+use rocket::http::{ContentType, Header, Status};
 use rocket::request::{FromParam, Request};
 use rocket::response::{self, Responder};
 
@@ -197,24 +196,37 @@ enum FileError {
     SqlError(&'static str, #[response(ignore)] SqlError),
     #[response(status = 500)]
     IoError(&'static str, #[response(ignore)] std::io::Error),
-    #[response(status = 413)]
-    FileTooBig(&'static str),
     #[response(status = 400)]
     Uuid(&'static str),
     #[response(status = 422)]
     InvalidForm(&'static str),
 }
 
+impl FileError {
+    fn uuid() -> Self {
+        Self::Uuid("EINVAL: invalid argument\n// sfc /scannow in progress check back later.\n")
+    }
+
+    fn invalid_form() -> Self {
+        Self::InvalidForm(
+            "EINVAL: invalid argument\n// You are probably lost. Try and go back to the start.\n",
+        )
+    }
+}
+
 impl From<std::io::Error> for FileError {
     fn from(e: std::io::Error) -> Self {
-        Self::IoError("EIO: I/O error\n", e)
+        Self::IoError(
+            "EIO: I/O error\n// RAID0 on a RAM drive was not a smart idea.\n",
+            e,
+        )
     }
 }
 
 impl From<SqlError> for FileError {
     fn from(e: SqlError) -> Self {
         Self::SqlError(
-            "EROFS: Read-only file system\n// I thought this error was impossible\n",
+            "EROFS: Read-only file system\n// I thought this error was impossible, but here we are.\n",
             e,
         )
     }
@@ -257,21 +269,17 @@ async fn download_file_named(
 
 #[get("/fd/<_>", rank = 2)]
 async fn download_file_invalid_fd() -> FileError {
-    FileError::Uuid("EINVAL: invalid argument\n")
+    FileError::uuid()
 }
 
 async fn upload_file(
     db: Connection<FileIndex>,
     name: Option<String>,
-    file: &mut Capped<TempFile<'_>>,
+    file: &mut TempFile<'_>,
     addr: IpAddr,
     base_url: &Absolute<'_>,
     file_path: &Path,
 ) -> Result<Option<String>, FileError> {
-    if !file.is_complete() {
-        return Err(FileError::FileTooBig("ENOSPC: No space left on device"));
-    }
-
     let fd: FileDescriptor = Uuid::new_v4().into();
 
     let path = Path::new(&file_path).join(fd.to_string());
@@ -289,7 +297,7 @@ async fn upload_file(
 #[post("/raw", format = "application/x-www-form-urlencoded", data = "<file>")]
 async fn upload_file_raw(
     db: Connection<FileIndex>,
-    mut file: Capped<TempFile<'_>>,
+    mut file: TempFile<'_>,
     addr: IpAddr,
     config: &State<AppConfig<'_>>,
 ) -> Result<Option<String>, FileError> {
@@ -306,12 +314,12 @@ async fn upload_file_raw(
 
 #[post("/raw", format = "multipart/form-data", rank = 2)]
 async fn upload_file_raw_invalid() -> FileError {
-    FileError::InvalidForm("EINVAL: invalid argument\n")
+    FileError::invalid_form()
 }
 
 #[derive(FromForm)]
 struct FileDescriptorForm<'r> {
-    file: Capped<TempFile<'r>>,
+    file: TempFile<'r>,
     name: Option<String>,
 }
 
@@ -336,7 +344,7 @@ async fn upload_file_form(
 #[catch(404)]
 fn not_found(req: &Request) -> String {
     format!(
-        "thread 'rocket-worker-thread' panicked at 'ENOENT: No such file or directory \"{}\"', src/main.rs:267:4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        "thread 'rocket-worker-thread' panicked at 'ENOENT: No such file or directory \"{}\"', src/main.rs:267:4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n// Who left that .unwrap() in?",
         req.uri()
     )
 }
@@ -344,19 +352,30 @@ fn not_found(req: &Request) -> String {
 #[catch(404)]
 fn file_not_found(req: &Request) -> String {
     format!(
-        "ENOENT: No such file or directory: \"{}\"\n",
+        "ENOENT: No such file or directory: \"{}\"\n// I think we lost that one yesterday.",
         &req.uri().to_string()[4..]
     )
 }
 
 #[catch(422)]
 fn invalid_form() -> &'static str {
-    "EINVAL: Invalid argument"
+    "EINVAL: Invalid argument\n"
+}
+
+#[catch(413)]
+fn too_large() -> &'static str {
+    "ENOSPC: No space left on device\n// Maybe it's time to get a bigger hard drive?\n"
+}
+
+#[catch(500)]
+fn server_error() -> &'static str {
+    "fish: Job 1, 'cargo run --release' terminated by signal SIGSEGV (Address boundary error)\n// Look idk what to say, println!() is not helping here.\n"
 }
 
 #[catch(default)]
-fn server_error() -> &'static str {
-    "fish: Job 1, 'cargo run --release' terminated by signal SIGSEGV (Address boundary error)"
+fn default_error(status: Status, _: &Request) -> &'static str {
+    println!("default error: {}", status.code);
+    server_error()
 }
 
 #[launch]
@@ -373,7 +392,16 @@ fn rocket() -> _ {
                 upload_file_form
             ],
         )
-        .register("/", catchers![not_found, invalid_form, server_error])
+        .register(
+            "/",
+            catchers![
+                not_found,
+                invalid_form,
+                server_error,
+                too_large,
+                default_error
+            ],
+        )
         .register("/fd", catchers![file_not_found])
         .attach(FileIndex::init())
         .attach(AdHoc::config::<AppConfig>())

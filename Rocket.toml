@@ -8,3 +8,7 @@ idle_timeout = 120
 [debug]
 file_path = "/tmp/test"
 base_url = "http://localhost:8000"
+
+[debug.limits]
+file = "4GB"
+data-form = "4GB"
