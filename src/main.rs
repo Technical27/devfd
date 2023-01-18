@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use tokio::fs::File;
 
 use rocket::form::Form;
@@ -116,7 +117,13 @@ impl<'r> Responder<'r, 'static> for FileDownload {
     fn respond_to(self, r: &'r Request<'_>) -> response::Result<'static> {
         let mut res = self.0.respond_to(r)?;
 
-        res.set_header(ContentType::Binary);
+        // res.set_header(ContentType::Binary);
+        // res.set_header()
+        //
+        println!("mime: {:?}", self.1.mime);
+        if let Some(mime) = self.1.mime {
+            res.set_header(mime);
+        }
 
         let filename = self.1.name.unwrap_or_else(|| self.1.fd.to_string());
 
@@ -136,14 +143,21 @@ struct FileIndex(rocket_db_pools::sqlx::SqlitePool);
 struct FileInfo {
     fd: FileDescriptor,
     name: Option<String>,
+    mime: Option<ContentType>,
     upload_ip: IpAddr,
 }
 
 impl FileInfo {
-    pub fn new(fd: FileDescriptor, name: Option<String>, upload_ip: IpAddr) -> Self {
+    pub fn new(
+        fd: FileDescriptor,
+        name: Option<String>,
+        mime: Option<ContentType>,
+        upload_ip: IpAddr,
+    ) -> Self {
         Self {
             fd,
             name,
+            mime,
             upload_ip,
         }
     }
@@ -154,9 +168,12 @@ async fn get_file(
     fd: FileDescriptor,
 ) -> Result<Option<FileInfo>, SqlError> {
     let f = fd.as_ref();
-    let info = match sqlx::query!("SELECT name, upload_ip FROM file_index WHERE fd = ?1", f)
-        .fetch_one(&mut *db)
-        .await
+    let info = match sqlx::query!(
+        "SELECT name, upload_ip, mime FROM file_index WHERE fd = ?1",
+        f
+    )
+    .fetch_one(&mut *db)
+    .await
     {
         Ok(i) => i,
         Err(SqlError::RowNotFound) => return Ok(None),
@@ -164,12 +181,22 @@ async fn get_file(
     };
 
     let name = info.name;
+
     let addr = match bytes_to_ip(info.upload_ip) {
         Some(a) => a,
         None => return Ok(None),
     };
 
-    Ok(Some(FileInfo::new(fd, name, addr)))
+    // let mime = match ContentType::from_str(info.mime).ok() {
+    //     Some(m) => m,
+    //     None => return Ok(None),
+    // };
+    let mime = info
+        .mime
+        .as_ref()
+        .and_then(|m| ContentType::from_str(m).ok());
+
+    Ok(Some(FileInfo::new(fd, name, mime, addr)))
 }
 
 async fn add_file(mut db: Connection<FileIndex>, info: FileInfo) -> Result<(), FileError> {
@@ -178,10 +205,12 @@ async fn add_file(mut db: Connection<FileIndex>, info: FileInfo) -> Result<(), F
         IpAddr::V6(a) => a.octets().to_vec(),
         IpAddr::V4(a) => a.octets().to_vec(),
     };
+    let mime = info.mime.map(|m| m.to_string());
     sqlx::query!(
-        "INSERT INTO file_index (fd, name, upload_ip) VALUES (?1, ?2, ?3)",
+        "INSERT INTO file_index (fd, name, mime, upload_ip) VALUES (?1, ?2, ?3, ?4)",
         f,
         info.name,
+        mime,
         upload_ip
     )
     .execute(&mut *db)
@@ -277,6 +306,14 @@ fn download_file_invalid_fd() -> FileError {
     FileError::uuid()
 }
 
+fn get_mime(path: &Path) -> Option<ContentType> {
+    let cookie = magic::Cookie::open(magic::CookieFlags::MIME).ok()?;
+    cookie.load::<&str>(&[]).ok()?;
+    let mime = ContentType::from_str(&cookie.file(path).ok()?).ok()?;
+    eprintln!("mtype: {:?}", mime);
+    Some(mime)
+}
+
 async fn upload_file(
     db: Connection<FileIndex>,
     name: Option<String>,
@@ -288,10 +325,11 @@ async fn upload_file(
     let fd: FileDescriptor = Uuid::new_v4().into();
 
     let path = Path::new(&file_path).join(fd.to_string());
-    file.move_copy_to(path.clone()).await?;
+    file.move_copy_to(&path).await?;
+    let mime = get_mime(&path);
 
-    let file = FileInfo::new(fd, name, addr);
-    add_file(db, file).await?;
+    let info = FileInfo::new(fd, name, mime, addr);
+    add_file(db, info).await?;
 
     Ok(Some(format!(
         "{}\n",
@@ -349,7 +387,7 @@ async fn upload_file_form(
 #[catch(404)]
 fn not_found(req: &Request) -> String {
     format!(
-        "thread 'rocket-worker-thread' panicked at 'ENOENT: No such file or directory \"{}\"', src/main.rs:267:4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n// Who left that .unwrap() in?",
+        "thread 'rocket-worker-thread' panicked at 'ENOENT: No such file or directory \"{}\"', src/main.rs:267:4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n// Who left that .unwrap() in?\n",
         req.uri()
     )
 }
@@ -357,7 +395,7 @@ fn not_found(req: &Request) -> String {
 #[catch(404)]
 fn file_not_found(req: &Request) -> String {
     format!(
-        "ENOENT: No such file or directory: \"{}\"\n// I think we lost that one yesterday.",
+        "ENOENT: No such file or directory: \"{}\"\n// I think we lost that one yesterday.\n",
         &req.uri().to_string()[4..]
     )
 }
@@ -379,7 +417,7 @@ fn server_error() -> &'static str {
 
 #[catch(default)]
 fn default_error(status: Status, _: &Request) -> &'static str {
-    println!("default error: {}", status.code);
+    eprintln!("default error: {}", status.code);
     server_error()
 }
 

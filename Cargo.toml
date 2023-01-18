@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 rocket = "0.5.0-rc.2"
+magic = "0.13"
 uuid = { version = "0.8.2", features = [ "v4" ] }
 sqlx = { version = "0.5", features  = [ "runtime-tokio-rustls", "uuid" ] }
 serde = { version = "1.0", features = [ "derive" ] }
