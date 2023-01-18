@@ -248,6 +248,11 @@ async fn start_file_download(
     })
 }
 
+#[get("/")]
+fn index() -> &'static str {
+    "/dev/fd\n\n// simple file uploads\n// If you are lost then this isn't for you"
+}
+
 #[get("/fd/<fd>")]
 async fn download_file(
     db: Connection<FileIndex>,
@@ -268,7 +273,7 @@ async fn download_file_named(
 }
 
 #[get("/fd/<_>", rank = 2)]
-async fn download_file_invalid_fd() -> FileError {
+fn download_file_invalid_fd() -> FileError {
     FileError::uuid()
 }
 
@@ -313,7 +318,7 @@ async fn upload_file_raw(
 }
 
 #[post("/raw", format = "multipart/form-data", rank = 2)]
-async fn upload_file_raw_invalid() -> FileError {
+fn upload_file_raw_invalid() -> FileError {
     FileError::invalid_form()
 }
 
